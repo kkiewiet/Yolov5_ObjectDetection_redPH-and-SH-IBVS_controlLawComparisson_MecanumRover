@@ -40,19 +40,15 @@ MAX_LOST_FRAMES = 20
 CONF_THRESH = 0.4
 
 # =========== IBVS parameters (Size/Distance control) ===========
-LAMBDA_U = 1.906
-LAMBDA_V = 1.906
-OBJ_HEIGHT = 0.23
-D_C = 0.09
-
 # ===================== Image resolution (must match pipeline) =====================
 # Set IMG_WIDTH and IMG_HEIGHT to match your Hailo pipeline output resolution.
-IMG_WIDTH  = 640   # pixels
-IMG_HEIGHT = 640   # pixels
+IMG_WIDTH  = 1280   # pixels  (native camera resolution — recalibrated with 1280×720)
+IMG_HEIGHT = 720    # pixels
 
-# Pixel-scale camera parameters (derived — equivalent to focal lengths f_x, f_y)
-LAMBDA_U_PX = LAMBDA_U * IMG_WIDTH    # ≈ f_x  [px]
-LAMBDA_V_PX = LAMBDA_V * IMG_HEIGHT   # ≈ f_y  [px]
+F_PX     = 1458.42               # ← RECALIBRATE: run Experiment_lambda_cz.py with 1280×720 data
+LAMBDA_V = F_PX / IMG_HEIGHT     # normalised λ_v = f_px / H  (used in interaction matrix)
+OBJ_HEIGHT = 0.23
+D_C = 0.09
 
 KI_MU = 0.1
 KI_ELL = 0.001
@@ -80,30 +76,29 @@ ELL_DES_PX = ELL_DES * IMG_HEIGHT   # target bbox height  [px]
 MU_DES_PX  = 0.0                    # target x-offset from centre  [px]
 
 
-def compute_distance_from_apparent_size(ell_px, lambda_u_px=LAMBDA_U_PX, obj_height=OBJ_HEIGHT):
-    """Z = lambda_u_px * H_obj / ell_px  (pixel-space version)."""
+def compute_distance_from_apparent_size(ell_px, f_px=F_PX, obj_height=OBJ_HEIGHT):
+    """Z = f_px * H_obj / ell_px  (pixel-space depth estimate)."""
     if ell_px < 1e-6:
         return 10.0
-    return (lambda_u_px * obj_height) / ell_px
+    return (f_px * obj_height) / ell_px
 
 
-def interaction_matrix_mu_distance(mu_px, ell_px, cz, f_v_px=0.0,
-                                    lambda_u=LAMBDA_U_PX, lambda_v=LAMBDA_V_PX):
+def interaction_matrix_mu_distance(mu_px, ell_px, cz, f_v_px=0.0, f_px=F_PX):
     """Interaction matrix in pixel coordinates.
 
-    mu_px   : x-offset from image centre  [px]
-    ell_px  : bounding-box height          [px]
-    f_v_px  : y-offset from image centre  [px]
-    lambda_u, lambda_v : pixel-scale focal lengths  (= LAMBDA_U/V * IMG_W/H)
+    mu_px  : x-offset from image centre  [px]
+    ell_px : bounding-box height          [px]
+    f_v_px : y-offset from image centre  [px]
+    f_px   : pixel-scale focal length  (= LAMBDA_V * IMG_HEIGHT)
     """
     # Row 1: mu_dot
     J_mu = np.array([
-        -lambda_u / cz,
+        -f_px / cz,
         0.0,
         mu_px / cz,
-        (mu_px * f_v_px) / lambda_v,
-        -(lambda_u + (mu_px**2) / lambda_u),
-        (lambda_v * f_v_px) / lambda_u
+        (mu_px * f_v_px) / f_px,
+        -(f_px + (mu_px**2) / f_px),
+        f_v_px
     ], dtype=np.float32)
 
     # Row 2: ell_dot (apparent-size variation)
@@ -112,7 +107,7 @@ def interaction_matrix_mu_distance(mu_px, ell_px, cz, f_v_px=0.0,
         0.0,
         ell_px / cz,
         0,
-        -(ell_px * mu_px) / lambda_u,
+        -(ell_px * mu_px) / f_px,
         0.0
     ], dtype=np.float32)
 
@@ -194,10 +189,8 @@ class user_app_callback_class(app_callback_class):
         self.logger.writerow([f"# Z_DES_REF={_Z_DES_REF:.6f}"])
 
         # Camera model
-        self.logger.writerow([f"# LAMBDA_U={LAMBDA_U}"])
         self.logger.writerow([f"# LAMBDA_V={LAMBDA_V}"])
-        self.logger.writerow([f"# LAMBDA_U_PX={LAMBDA_U_PX:.4f}"])
-        self.logger.writerow([f"# LAMBDA_V_PX={LAMBDA_V_PX:.4f}"])
+        self.logger.writerow([f"# F_PX={F_PX:.4f}"])
         self.logger.writerow([f"# OBJ_HEIGHT={OBJ_HEIGHT}"])
         self.logger.writerow([f"# D_C={D_C}"])
 
@@ -254,8 +247,10 @@ def app_callback(pad, info, user_data):
     string_to_print = f"Frame count: {user_data.get_count()}\n"
 
     fmt, width, height = get_caps_from_pad(pad)
-    img_w = width  if width  else IMG_WIDTH
-    img_h = height if height else IMG_HEIGHT
+    # Always use IMG_WIDTH/IMG_HEIGHT so bbox pixel coords match the calibration space.
+    # Hailo bbox coords are normalised to the inference input (640×640), not the display frame.
+    img_w = IMG_WIDTH
+    img_h = IMG_HEIGHT
 
     frame = None
     if user_data.use_frame and fmt is not None:
