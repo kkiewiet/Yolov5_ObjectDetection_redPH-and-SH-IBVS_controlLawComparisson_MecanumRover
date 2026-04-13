@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""
+experiment_lambda_cz.py  —  Calibrate λ_v and validate Z_est at multiple distances.
+
+Usage
+-----
+    python3 Experiment_lambda_cz.py ibvs_log_lambda_d1.00m.csv ibvs_log_lambda_d2.00m.csv ibvs_log_lambda_d3.00m.csv
+"""
+import sys
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+
+# Default object height in metres (bottle height)
+DEFAULT_OBJ_HEIGHT = 0.23   # m
+DEFAULT_LAMBDA_V   = 1458.42  # ← update after recalibration with 1280×720
+
+
+def _parse_distance(path):
+    """Extract actual distance (metres) from filename, e.g. _d1.00m → 1.00."""
+    m = re.search(r'_d([0-9]+(?:\.[0-9]+)?)m', os.path.basename(path))
+    if m:
+        return float(m.group(1))
+    raise ValueError(
+        f"Cannot parse distance from '{os.path.basename(path)}'.\n"
+        f"  Rename file to include _d<value>m, e.g. ibvs_log_lambda_d1.00m.csv"
+    )
+
+
+def load_csv_with_metadata(path):
+    """
+    Load CSV file with metadata in comment lines.
+    Returns: (metadata_dict, dataframe)
+    """
+    metadata = {}
+    header_line = None
+    data_start = 0
+   
+    # First pass: find the header line and metadata
+    with open(path, 'r') as f:
+        for i, line in enumerate(f):
+            line_stripped = line.strip()
+           
+            # Skip empty lines
+            if not line_stripped:
+                continue
+           
+            # Handle comment lines
+            if line_stripped.startswith('#') or line_stripped.startswith('"#'):
+                # Remove leading # and quotes
+                clean_line = line_stripped.lstrip('"').lstrip('#').strip().rstrip('"')
+               
+                # Try to parse key=value pairs
+                if '=' in clean_line:
+                    parts = clean_line.split('=', 1)
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        value = parts[1].strip()
+                        metadata[key] = value
+                continue
+           
+            # First non-comment line should be the header
+            if header_line is None and ',' in line_stripped:
+                # Check if this looks like a header (contains column names)
+                if 't,' in line_stripped or 'mu,' in line_stripped or 'ell,' in line_stripped:
+                    header_line = i
+                    data_start = i
+                    break
+   
+    # Load the CSV, skipping lines before the header
+    if header_line is not None:
+        df = pd.read_csv(path, skiprows=header_line, nrows=None)
+    else:
+        # Fallback: try loading with comment='#'
+        df = pd.read_csv(path, comment='#')
+   
+    # Clean column names (remove quotes and whitespace)
+    df.columns = df.columns.str.strip().str.replace('"', '')
+   
+    return metadata, df
+
+
+def _ell_stats(data):
+    """Return (mean_ell, std_ell, all_ell_values) for valid rows."""
+   
+    # Check if 'ell' column exists
+    if 'ell' not in data.columns:
+        print(f"    ✗ Warning: 'ell' column not found.")
+        print(f"    Available columns: {list(data.columns)}")
+       
+        # Try to find similar columns
+        for col in data.columns:
+            if 'ell' in col.lower():
+                print(f"    Found similar column: '{col}' - using this instead")
+                ell = data[col].values
+                break
+        else:
+            return float('nan'), float('nan'), np.array([])
+    else:
+        ell = data['ell'].values
+   
+    # Filter out NaN and zeros (invalid detections)
+    ell = ell[~np.isnan(ell)]
+    ell = ell[ell > 0]
+
+    if len(ell) == 0:
+        return float('nan'), float('nan'), np.array([])
+
+    # IQR outlier filter — removes movement artifacts from manual experiment stop
+    q1, q3 = np.percentile(ell, [25, 75])
+    iqr = q3 - q1
+    ell = ell[(ell >= q1 - 1.5 * iqr) & (ell <= q3 + 1.5 * iqr)]
+
+    if len(ell) == 0:
+        return float('nan'), float('nan'), np.array([])
+
+    return float(np.mean(ell)), float(np.std(ell)), ell
+
+
+def _fit_lambda(actual_z, mean_ell, obj_height):
+    """
+    Linear regression of c_z vs 1/ℓ:
+        c_z = λ_v * OBJ_HEIGHT * (1/ℓ)
+    Returns λ_v_fit, R² value, slope, intercept
+    """
+    inv_ell = 1.0 / mean_ell
+    slope, intercept, r_value, p_value, std_err = stats.linregress(inv_ell, actual_z)
+
+    # λ_v = slope / OBJ_HEIGHT
+    lam_v = slope / obj_height
+    r_squared = r_value ** 2
+
+    return lam_v, r_squared, slope, intercept
+
+
+def apply_style():
+    """Apply matplotlib style."""
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid')
+    except:
+        try:
+            plt.style.use('seaborn-darkgrid')
+        except:
+            pass  # Use default
+
+
+def main(paths):
+    if len(paths) < 2:
+        print('Provide at least 2 CSV files (one per known distance).')
+        print('Example: python3 Experiment_lambda_cz.py ibvs_log_lambda_d1.00m.csv ibvs_log_lambda_d2.00m.csv ibvs_log_lambda_d3.00m.csv')
+        sys.exit(1)
+
+    # ── Load & parse ──────────────────────────────────────────────────────────
+    entries = []
+    for path in paths:
+        print(f"\n{'─'*60}")
+        print(f"Processing: {path}")
+        print('─'*60)
+       
+        try:
+            actual_z = _parse_distance(path)
+            print(f"  ✓ Parsed distance: {actual_z:.2f} m")
+        except ValueError as e:
+            print(f'  ✗ Skip: {e}')
+            continue
+       
+        try:
+            meta, data = load_csv_with_metadata(path)
+            print(f"  ✓ Loaded CSV: {len(data)} rows, {len(data.columns)} columns")
+            print(f"  Columns: {list(data.columns)[:10]}...")  # Show first 10 columns
+           
+            # Show metadata
+            if meta:
+                print(f"  Metadata: {meta}")
+           
+        except Exception as e:
+            print(f'  ✗ Skip: Failed to load CSV: {e}')
+            import traceback
+            traceback.print_exc()
+            continue
+
+        obj_h = float(meta.get('OBJ_HEIGHT', DEFAULT_OBJ_HEIGHT))
+        lam_v_current = float(meta.get('LAMBDA_V', DEFAULT_LAMBDA_V))
+
+        mean_e, std_e, raw_e = _ell_stats(data)
+        if np.isnan(mean_e):
+            print(f'  ✗ Skip: No valid detection data')
+            continue
+
+        print(f"  ✓ Mean ell: {mean_e:.4f} ± {std_e:.4f}  (n={len(raw_e)} samples)")
+
+        entries.append({
+            'actual_z':  actual_z,
+            'mean_ell':  mean_e,
+            'std_ell':   std_e,
+            'raw_ell':   raw_e,
+            'obj_h':     obj_h,
+            'lam_cur':   lam_v_current,
+            'label':     f'{actual_z:.2f} m',
+        })
+
+    if not entries:
+        print('\n' + '='*60)
+        print('✗ No usable entries found. Check your CSV files.')
+        print('='*60)
+        sys.exit(1)
+
+    entries.sort(key=lambda e: e['actual_z'])
+
+    actual_z  = np.array([e['actual_z']  for e in entries])
+    mean_ell  = np.array([e['mean_ell']  for e in entries])
+    std_ell   = np.array([e['std_ell']   for e in entries])
+    obj_h     = entries[0]['obj_h']
+    lam_cur   = entries[0]['lam_cur']
+
+    # ── Fit λ_v ───────────────────────────────────────────────────────────────
+    lam_fit, r_squared, slope, intercept = _fit_lambda(actual_z, mean_ell, obj_h)
+
+    # Estimated Z using fitted λ_v
+    z_est_fit = lam_fit * obj_h / mean_ell
+    z_est_err = np.abs(lam_fit * obj_h / mean_ell**2 * std_ell)
+
+    rmse = float(np.sqrt(np.mean((z_est_fit - actual_z)**2)))
+
+    # ── Console output ────────────────────────────────────────────────────────
+    print('\n' + '=' * 70)
+    print('  λ_v / C_z Calibration Results')
+    print('=' * 70)
+    print(f'  Object height H               : {obj_h:.3f} m')
+    print(f'  Number of test distances      : {len(entries)}')
+    print(f'  Distance range                : {actual_z.min():.2f} - {actual_z.max():.2f} m')
+    print('-' * 70)
+    print(f'  λ_v (current in code)         : {lam_cur:.4f}')
+    print(f'  λ_v (fitted from data)        : {lam_fit:.4f}')
+    print(f'  Relative change               : {(lam_fit - lam_cur) / lam_cur * 100:+.1f}%')
+    print(f'  R² (goodness of fit)          : {r_squared:.4f}')
+    print(f'  Regression slope              : {slope:.4f}')
+    print(f'  Regression intercept          : {intercept:.4f} m')
+    print('-' * 70)
+    print(f'  RMSE (fitted λ_v)             : {rmse:.4f} m  ({rmse/actual_z.mean()*100:.1f}%)')
+    print('=' * 70)
+    print(f'  {"Actual Z":>10}  {"Mean ℓ":>10}  {"Std ℓ":>10}  {"Z_est":>10}  {"Error":>10}  {"Err %":>8}')
+    print('-' * 70)
+    for e, z_e, z_err in zip(entries, z_est_fit, z_est_err):
+        err_abs = z_e - e['actual_z']
+        err_pct = (err_abs / e['actual_z']) * 100
+        print(f'  {e["actual_z"]:>10.2f}  {e["mean_ell"]:>10.4f}  '
+              f'{e["std_ell"]:>10.4f}  {z_e:>10.4f}  {err_abs:>+10.4f}  {err_pct:>+7.1f}%')
+    print('=' * 70 + '\n')
+
+    print(f'✓ Recommended setting for your code:  LAMBDA_V = {lam_fit:.4f}\n')
+
+    # ── Plotting ──────────────────────────────────────────────────────────────
+    apply_style()
+    fig, ax_reg = plt.subplots(figsize=(8, 6))
+
+    # ── Linear regression c_z vs 1/ℓ ─────────────────────────────────────────
+    inv_ell = 1.0 / mean_ell
+
+    ax_reg.plot(inv_ell, actual_z, 'o', color='#1f77b4',
+                markersize=8, label='Measured data', zorder=3)
+
+    inv_ell_range = np.linspace(inv_ell.min() * 0.8, inv_ell.max() * 1.2, 100)
+    z_fit_line = slope * inv_ell_range + intercept
+    ax_reg.plot(inv_ell_range, z_fit_line, 'r-', linewidth=2,
+                label=f'Linear fit: c_z = {slope:.3f}·(1/ℓ) + {intercept:.3f}')
+
+    for i, e in enumerate(entries):
+        ax_reg.annotate(f'{e["actual_z"]:.1f}m',
+                       (inv_ell[i], actual_z[i]),
+                       textcoords="offset points", xytext=(8,5),
+                       fontsize=8, color='#1f77b4')
+
+    ax_reg.set_xlabel('1 / ℓ  [–]', fontsize=10)
+    ax_reg.set_ylabel('Actual distance c_z  [m]', fontsize=10)
+    ax_reg.legend(fontsize=9, loc='upper left')
+    ax_reg.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = 'experiment_lambda_cz.pdf'
+    fig.savefig(out, bbox_inches='tight')
+    print(f'✓ Saved plot → {out}')
+    plt.show()
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print('\nExample usage for 2m, 3m distances:')
+        print('  python3 Experiment_lambda_cz.py ibvs_log_lambda_d2.00m.csv ibvs_log_lambda_d3.00m.csv')
+        sys.exit(1)
+    main(sys.argv[1:])
